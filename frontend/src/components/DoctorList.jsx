@@ -154,15 +154,15 @@ export default function DoctorList({ hospitals = [], doctors = [], specialty, us
   const sourceDoctors = doctors.length > 0 ? doctors : doctorsFromHospitals;
   const seenDoctors = new Set();
   const allDoctors = sourceDoctors.filter((doctor) => {
-    const locationText = getDoctorLocationText(doctor);
-    const key = [
-      doctor?.name || '',
-      doctor?.specialty || '',
-      locationText,
-      doctor?.phone || doctor?.contact_number || '',
-    ].join('|');
-    if (seenDoctors.has(key)) return false;
-    seenDoctors.add(key);
+    const name = String(doctor?.name || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+    if (!name) return false;
+
+    // Prefer unique display names so merged recommendation sources don't repeat cards.
+    if (seenDoctors.has(name)) return false;
+    seenDoctors.add(name);
     return true;
   });
 

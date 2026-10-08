@@ -187,6 +187,153 @@ def _display_specialty(canonical_specialty: str) -> str:
     return str(canonical_specialty or "General Physician").strip() or "General Physician"
 
 
+def _normalize_doctor_name_key(value: str) -> str:
+    """
+    Normalize doctor display names for identity matching.
+    """
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _doctor_contact_quality(contact_number) -> int:
+    """
+    Prefer rows that include a usable phone number.
+    """
+    text = str(contact_number or "").strip().lower()
+    if not text or text in {"unavailable", "nan", "none", "not available"}:
+        return 0
+    digits = re.sub(r"\D", "", text)
+    return 1 if len(digits) >= 8 else 0
+
+
+def _dedupe_doctors_dataframe(df: pd.DataFrame, preferred_specialty: str = "") -> pd.DataFrame:
+    """
+    Keep one row per doctor name.
+
+    Canonical specialty aliases (e.g. general physician + internal medicine, gynac +
+    obstetrician) otherwise surface the same person twice in one result list.
+    """
+    if df is None or df.empty:
+        return df
+
+    if "name" not in df.columns:
+        return df
+
+    work = df.copy()
+    preferred = canonicalize_specialty(preferred_specialty)
+    work["_name_key"] = work["name"].map(_normalize_doctor_name_key)
+    work = work[work["_name_key"].astype(str).str.len() > 0]
+    if work.empty:
+        return work.drop(columns=["_name_key"], errors="ignore")
+
+    if "specialty" in work.columns:
+        work["_specialty_canonical"] = work["specialty"].map(canonicalize_specialty)
+        work["_specialty_raw"] = work["specialty"].astype(str).str.strip().str.lower()
+        work["_preferred_specialty"] = work["_specialty_canonical"].eq(preferred).astype(int) if preferred else 0
+        work["_exact_specialty"] = work["_specialty_raw"].eq(preferred).astype(int) if preferred else 0
+    else:
+        work["_preferred_specialty"] = 0
+        work["_exact_specialty"] = 0
+
+    if "rating_score" in work.columns:
+        work["_rating_rank"] = pd.to_numeric(work["rating_score"], errors="coerce").fillna(0.0)
+    else:
+        work["_rating_rank"] = 0.0
+
+    if "consultation_fee" in work.columns:
+        work["_fee_rank"] = pd.to_numeric(work["consultation_fee"], errors="coerce").fillna(10**9)
+    else:
+        work["_fee_rank"] = 10**9
+
+    if "contact_number" in work.columns:
+        work["_contact_rank"] = work["contact_number"].map(_doctor_contact_quality)
+    else:
+        work["_contact_rank"] = 0
+
+    work = work.sort_values(
+        by=[
+            "_name_key",
+            "_preferred_specialty",
+            "_exact_specialty",
+            "_rating_rank",
+            "_contact_rank",
+            "_fee_rank",
+        ],
+        ascending=[True, False, False, False, False, True],
+    )
+    work = work.drop_duplicates(subset=["_name_key"], keep="first")
+    return work.drop(
+        columns=[
+            "_name_key",
+            "_specialty_canonical",
+            "_specialty_raw",
+            "_preferred_specialty",
+            "_exact_specialty",
+            "_rating_rank",
+            "_fee_rank",
+            "_contact_rank",
+        ],
+        errors="ignore",
+    ).reset_index(drop=True)
+
+
+def _dedupe_doctor_dicts(doctors: list, preferred_specialty: str = "") -> list:
+    """
+    Keep one dict per doctor name while preserving input preference order ties.
+    """
+    if not isinstance(doctors, list) or not doctors:
+        return []
+
+    preferred = canonicalize_specialty(preferred_specialty)
+    best_by_name = {}
+    order = []
+
+    for index, doctor in enumerate(doctors):
+        if not isinstance(doctor, dict):
+            continue
+        name_key = _normalize_doctor_name_key(doctor.get("name"))
+        if not name_key:
+            continue
+
+        specialty_raw = str(doctor.get("specialty") or "").strip().lower()
+        specialty_canonical = canonicalize_specialty(doctor.get("specialty"))
+        rating = _to_float_or_none(doctor.get("rating_score"))
+        if rating is None:
+            rating = _to_float_or_none(doctor.get("rating")) or 0.0
+        # rating_score may already be on 0-10 scale from rank_doctors
+        if rating > 1.5:
+            rating_rank = rating
+        else:
+            rating_rank = rating * 10
+        contact_rank = _doctor_contact_quality(
+            doctor.get("contact_number") or doctor.get("phone")
+        )
+        fee = _to_float_or_none(doctor.get("consultation_fee"))
+        fee_rank = fee if fee is not None else 10**9
+        preferred_rank = 1 if preferred and specialty_canonical == preferred else 0
+        exact_rank = 1 if preferred and specialty_raw == preferred else 0
+        score = (
+            preferred_rank,
+            exact_rank,
+            rating_rank,
+            contact_rank,
+            -fee_rank,
+            -index,
+        )
+
+        existing = best_by_name.get(name_key)
+        if existing is None:
+            best_by_name[name_key] = (score, doctor)
+            order.append(name_key)
+            continue
+
+        if score > existing[0]:
+            best_by_name[name_key] = (score, doctor)
+
+    return [best_by_name[name_key][1] for name_key in order if name_key in best_by_name]
+
+
 def _extract_hospital_specialty_keys(specialties_value: str) -> set:
     """
     Extract canonical specialty keys from a hospital specialties field.
@@ -753,6 +900,15 @@ def load_doctors_data():
         df['location'] = df['location'].astype('str')
         df['specialty'] = df['specialty'].astype('str')
 
+        # Drop exact duplicate doctor rows, keeping the highest-rated entry.
+        df['_name_key'] = df['name'].astype(str).str.strip().str.lower()
+        df = df.sort_values(
+            by=['_name_key', 'location', 'specialty', 'rating_score', 'consultation_fee'],
+            ascending=[True, True, True, False, True],
+        )
+        df = df.drop_duplicates(subset=['_name_key', 'location', 'specialty'], keep='first')
+        df = df.drop(columns=['_name_key']).reset_index(drop=True)
+
         # Validate LOCATION_COORDS covers all dataset locations
         dataset_locations = set(df['location'].dropna().unique())
         coords_locations = set(LOCATION_COORDS.keys())
@@ -860,7 +1016,7 @@ def _generate_reason(rating_score, consultation_fee, location_score, percentile_
     return " • ".join(reasons) if reasons else "Balanced recommendation"
 
 
-def rank_doctors(df, user_location, severity="medium", top_k=5):
+def rank_doctors(df, user_location, severity="medium", top_k=5, preferred_specialty=""):
     """
     Rank doctors based on a weighted scoring system adjusted by severity level.
     
@@ -870,6 +1026,7 @@ def rank_doctors(df, user_location, severity="medium", top_k=5):
         user_location (str): User's preferred location.
         severity (str): Severity level - "low", "medium", "high". Default is "medium".
         top_k (int): Number of top results to return. Default is 5.
+        preferred_specialty (str): Specialty used to pick one row when aliases collide.
     
     Severity-based weighting:
         - "low": Rating 0.5, Cost 0.3, Location 0.2 (standard)
@@ -887,7 +1044,9 @@ def rank_doctors(df, user_location, severity="medium", top_k=5):
         raise ValueError(f"DataFrame must contain columns: {required_columns}")
     
     # Create a copy to avoid modifying original data
-    df = df.copy()
+    df = _dedupe_doctors_dataframe(df.copy(), preferred_specialty=preferred_specialty)
+    if df.empty:
+        return []
     
     user_location_key = str(user_location).strip().lower()
 
@@ -939,7 +1098,7 @@ def rank_doctors(df, user_location, severity="medium", top_k=5):
         
         results.append({
             'name': row['name'],
-            'specialty': row['specialty'],
+            'specialty': _display_specialty(row['specialty']),
             'location': row['location'],
             'consultation_fee': int(_convert_to_json_serializable(row['consultation_fee'])),
             # Expose doctor rating on a user-friendly 0-10 scale.
@@ -951,7 +1110,7 @@ def rank_doctors(df, user_location, severity="medium", top_k=5):
             'longitude': longitude
         })
     
-    return results
+    return _dedupe_doctor_dicts(results, preferred_specialty=preferred_specialty)
 
 
 def recommend_doctors(input_data: dict):
@@ -1164,7 +1323,13 @@ def recommend_doctors(input_data: dict):
     total_matches = len(filtered_df)
     
     # Rank doctors based on severity
-    recommended = rank_doctors(filtered_df, location, severity=severity, top_k=DEFAULT_TOP_K)
+    recommended = rank_doctors(
+        filtered_df,
+        location,
+        severity=severity,
+        top_k=DEFAULT_TOP_K,
+        preferred_specialty=specialty,
+    )
 
     # Keep requested specialty doctors first, then GP supplements.
     if supplemented_with_general_physician:
@@ -1177,6 +1342,8 @@ def recommend_doctors(input_data: dict):
             if str(doctor.get("specialty", "")).lower() == "general physician"
         ]
         recommended = specialty_first + gp_supplements
+
+    recommended = _dedupe_doctor_dicts(recommended, preferred_specialty=specialty)
     
     # Return structured response
     return {
@@ -2334,35 +2501,43 @@ def build_closest_care_results(
     specialty_hospitals = [item for item in specialty_candidates if item.get("type") == "hospital"]
     deduped_hospitals = _dedupe_hospital_records_by_brand(specialty_hospitals)
     specialty_doctors = [item for item in specialty_candidates if item.get("type") != "hospital"]
-    specialty_candidates = specialty_doctors + deduped_hospitals
+    deduped_doctors = _dedupe_doctor_dicts(specialty_doctors, preferred_specialty=specialty_key)
+
+    specialty_candidates = deduped_doctors + deduped_hospitals
     specialty_candidates.sort(key=_proximity_sort_key)
     selected = specialty_candidates[:top_k]
 
     if len(selected) < top_k and specialty_key != "general physician":
         gp_fallback_candidates.sort(key=_proximity_sort_key)
-        seen_fallback_keys = {
-            (
-                item.get("type"),
-                str(item.get("name", "")).strip().lower(),
-                _to_float_or_none(item.get("lat")),
-                _to_float_or_none(item.get("lng")),
-            )
+        gp_fallback_candidates = _dedupe_doctor_dicts(
+            gp_fallback_candidates,
+            preferred_specialty="general physician",
+        )
+        seen_fallback_names = {
+            _normalize_doctor_name_key(item.get("name"))
             for item in selected
+            if item.get("type") == "doctor"
         }
         for candidate in gp_fallback_candidates:
-            candidate_key = (
-                candidate.get("type"),
-                str(candidate.get("name", "")).strip().lower(),
-                _to_float_or_none(candidate.get("lat")),
-                _to_float_or_none(candidate.get("lng")),
-            )
-            if candidate_key in seen_fallback_keys:
+            name_key = _normalize_doctor_name_key(candidate.get("name"))
+            if name_key and name_key in seen_fallback_names:
                 continue
             selected.append(candidate)
-            seen_fallback_keys.add(candidate_key)
+            if name_key:
+                seen_fallback_names.add(name_key)
             if len(selected) >= top_k:
                 break
 
+    selected.sort(key=_proximity_sort_key)
+    selected = selected[:top_k]
+
+    # Final pass: hospitals stay brand-deduped; doctors stay unique by name.
+    final_doctors = _dedupe_doctor_dicts(
+        [item for item in selected if item.get("type") == "doctor"],
+        preferred_specialty=specialty_key,
+    )
+    final_hospitals = [item for item in selected if item.get("type") == "hospital"]
+    selected = final_doctors + final_hospitals
     selected.sort(key=_proximity_sort_key)
     selected = selected[:top_k]
 
@@ -2387,6 +2562,71 @@ def build_closest_care_results(
         })
 
     return results
+
+
+def _finalize_recommendation_doctor_lists(response: dict, preferred_specialty: str = "") -> dict:
+    """
+    Ensure doctor names are unique across recommended, optional, and closest lists.
+    """
+    if not isinstance(response, dict) or response.get("error"):
+        return response
+
+    preferred = canonicalize_specialty(preferred_specialty) or canonicalize_specialty(
+        (response.get("metadata") or {}).get("query_specialty")
+    )
+
+    primary = _dedupe_doctor_dicts(response.get("recommended_doctors") or [], preferred)
+    primary_names = {
+        _normalize_doctor_name_key(doctor.get("name"))
+        for doctor in primary
+        if _normalize_doctor_name_key(doctor.get("name"))
+    }
+
+    optional_block = response.get("optional_nearby_doctors")
+    optional_doctors = []
+    if isinstance(optional_block, dict):
+        optional_doctors = [
+            doctor
+            for doctor in _dedupe_doctor_dicts(
+                optional_block.get("recommended_doctors") or [],
+                preferred,
+            )
+            if _normalize_doctor_name_key(doctor.get("name")) not in primary_names
+        ]
+
+    claimed_names = primary_names | {
+        _normalize_doctor_name_key(doctor.get("name"))
+        for doctor in optional_doctors
+        if _normalize_doctor_name_key(doctor.get("name"))
+    }
+
+    cleaned_closest = []
+    seen_closest_names = set()
+    for item in response.get("closest_results") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).lower() == "doctor":
+            name_key = _normalize_doctor_name_key(item.get("name"))
+            if not name_key or name_key in claimed_names or name_key in seen_closest_names:
+                continue
+            seen_closest_names.add(name_key)
+        cleaned_closest.append(item)
+
+    if "recommended_doctors" in response:
+        response["recommended_doctors"] = primary
+    if isinstance(optional_block, dict):
+        response["optional_nearby_doctors"] = {
+            **optional_block,
+            "recommended_doctors": optional_doctors,
+            "returned_count": len(optional_doctors),
+            "total_doctors_available": optional_block.get(
+                "total_doctors_available",
+                len(optional_doctors),
+            ),
+        }
+    if "closest_results" in response:
+        response["closest_results"] = cleaned_closest
+    return response
 
 
 def generate_recommendation_response(input_data: dict):
@@ -2525,7 +2765,7 @@ def generate_recommendation_response(input_data: dict):
         }
         if "message" in hospital_results:
             response["message"] = hospital_results["message"]
-        return response
+        return _finalize_recommendation_doctor_lists(response, preferred_specialty=specialty)
     
     elif severity == "medium":
         # MEDIUM: Strict logic first, then staged guaranteed fallback.
@@ -2539,35 +2779,38 @@ def generate_recommendation_response(input_data: dict):
         
         if hospital_count > 0:
             # Hospitals found - return hospital recommendations plus optional nearby doctors
-            return {
-                "care_setting": "hospital",
-                "metadata": {
-                    "query_specialty": specialty,
-                    "query_location": location,
-                    "query_severity": severity,
-                    "severity": severity,
-                    "recommendation_type": "hospital_primary",
-                    "optional_doctors_available": len(recommended_doctors) > 0,
-                    "strict_result_empty": hospital_metadata.get("strict_result_empty", False),
-                    "guaranteed_fallback_applied": hospital_metadata.get("guaranteed_fallback_applied", False),
-                    "guaranteed_fallback_stage": hospital_metadata.get("guaranteed_fallback_stage"),
-                    "location_source": location_source,
-                    "detected_location": location if location_source.startswith("coordinates") else None,
-                    "coordinates_out_of_coverage": coordinates_out_of_coverage
+            return _finalize_recommendation_doctor_lists(
+                {
+                    "care_setting": "hospital",
+                    "metadata": {
+                        "query_specialty": specialty,
+                        "query_location": location,
+                        "query_severity": severity,
+                        "severity": severity,
+                        "recommendation_type": "hospital_primary",
+                        "optional_doctors_available": len(recommended_doctors) > 0,
+                        "strict_result_empty": hospital_metadata.get("strict_result_empty", False),
+                        "guaranteed_fallback_applied": hospital_metadata.get("guaranteed_fallback_applied", False),
+                        "guaranteed_fallback_stage": hospital_metadata.get("guaranteed_fallback_stage"),
+                        "location_source": location_source,
+                        "detected_location": location if location_source.startswith("coordinates") else None,
+                        "coordinates_out_of_coverage": coordinates_out_of_coverage
+                    },
+                    "recommended_hospitals": hospital_results.get("recommended_hospitals", []),
+                    "total_hospitals_available": hospital_count,
+                    "closest_results": closest_results,
+                    "optional_nearby_doctors": {
+                        "recommended_doctors": recommended_doctors,
+                        "total_doctors_available": doctor_recommendations.get("total_matches", 0),
+                        "returned_count": len(recommended_doctors),
+                        "fallback_applied": doctor_fallback_metadata.get("fallback_applied", False),
+                        "fallback_location": doctor_fallback_metadata.get("fallback_location"),
+                        "fallback_type": doctor_fallback_type,
+                        "cost_summary": _generate_cost_summary_from_recommendations(recommended_doctors)
+                    }
                 },
-                "recommended_hospitals": hospital_results.get("recommended_hospitals", []),
-                "total_hospitals_available": hospital_count,
-                "closest_results": closest_results,
-                "optional_nearby_doctors": {
-                    "recommended_doctors": recommended_doctors,
-                    "total_doctors_available": doctor_recommendations.get("total_matches", 0),
-                    "returned_count": len(recommended_doctors),
-                    "fallback_applied": doctor_fallback_metadata.get("fallback_applied", False),
-                    "fallback_location": doctor_fallback_metadata.get("fallback_location"),
-                    "fallback_type": doctor_fallback_type,
-                    "cost_summary": _generate_cost_summary_from_recommendations(recommended_doctors)
-                }
-            }
+                preferred_specialty=specialty,
+            )
         else:
             # No hospitals found - fallback to doctors
             cost_summary = _generate_cost_summary_from_recommendations(recommended_doctors)
@@ -2613,7 +2856,7 @@ def generate_recommendation_response(input_data: dict):
             if "message" in doctor_recommendations:
                 response["message"] = doctor_recommendations["message"]
             
-            return response
+            return _finalize_recommendation_doctor_lists(response, preferred_specialty=specialty)
     
     else:  # severity == "low"
         # LOW: Doctor engine only, with hospital fallback if no doctors found
@@ -2627,23 +2870,26 @@ def generate_recommendation_response(input_data: dict):
             
             if hospital_count > 0:
                 # Return hospital recommendations as fallback
-                return {
-                    "care_setting": "hospital",
-                    "metadata": {
-                        "query_specialty": specialty,
-                        "query_location": location,
-                        "query_severity": severity,
-                        "severity": severity,
-                        "recommendation_type": "hospital_fallback",
-                        "reason": "No doctors available, suggesting hospitals instead",
-                        "location_source": location_source,
-                        "detected_location": location if location_source.startswith("coordinates") else None,
-                        "coordinates_out_of_coverage": coordinates_out_of_coverage
+                return _finalize_recommendation_doctor_lists(
+                    {
+                        "care_setting": "hospital",
+                        "metadata": {
+                            "query_specialty": specialty,
+                            "query_location": location,
+                            "query_severity": severity,
+                            "severity": severity,
+                            "recommendation_type": "hospital_fallback",
+                            "reason": "No doctors available, suggesting hospitals instead",
+                            "location_source": location_source,
+                            "detected_location": location if location_source.startswith("coordinates") else None,
+                            "coordinates_out_of_coverage": coordinates_out_of_coverage
+                        },
+                        "recommended_hospitals": hospital_results.get("recommended_hospitals", []),
+                        "total_hospitals_available": hospital_count,
+                        "closest_results": closest_results
                     },
-                    "recommended_hospitals": hospital_results.get("recommended_hospitals", []),
-                    "total_hospitals_available": hospital_count,
-                    "closest_results": closest_results
-                }
+                    preferred_specialty=specialty,
+                )
         
         # Otherwise, continue with doctor recommendations
         recommended_doctors = doctor_recommendations.get("recommended_doctors", [])
@@ -2684,4 +2930,4 @@ def generate_recommendation_response(input_data: dict):
         if "message" in doctor_recommendations:
             response["message"] = doctor_recommendations["message"]
         
-        return response
+        return _finalize_recommendation_doctor_lists(response, preferred_specialty=specialty)

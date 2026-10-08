@@ -181,23 +181,54 @@ const formatCostEstimate = (scrapingOutput) => {
   return 'Contact provider for pricing';
 };
 
+const normalizeDoctorName = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+
+const normalizePhoneDigits = (value) => String(value || '').replace(/\D/g, '');
+
+const buildDoctorDedupeKey = (doctor) => {
+  const name = normalizeDoctorName(doctor?.name);
+  const location = extractDoctorLocation(doctor).toLowerCase();
+  const phone = normalizePhoneDigits(doctor?.phone || doctor?.contact_number);
+  // Same person often appears once from recommendations and once from closest_results
+  // with different specialty casing / phone formatting.
+  return `${name}|${location}|${phone}`;
+};
+
+const doctorRankScore = (doctor, preferredSpecialty = '') => {
+  const rating = toNumber(doctor?.rating) ?? -1;
+  const distance = toNumber(doctor?.distance_km);
+  const distanceScore = distance == null ? 0 : Math.max(0, 100 - distance);
+  const fallbackPenalty = doctor?.is_fallback || String(doctor?.availability || '').includes('Fallback') ? 0 : 10;
+  const phoneBonus = normalizePhoneDigits(doctor?.phone || doctor?.contact_number) ? 1 : 0;
+  const specialty = String(doctor?.specialty || '').trim().toLowerCase();
+  const preferred = String(preferredSpecialty || '').trim().toLowerCase();
+  const preferredBonus = preferred && specialty === preferred ? 8 : 0;
+  // Prefer the primary care label when the same doctor is listed under both GP and IM.
+  const specialtyBonus = specialty === 'general physician' ? 5 : specialty === 'internal medicine' ? 2 : 0;
+  return rating * 10 + distanceScore + fallbackPenalty + phoneBonus + preferredBonus + specialtyBonus;
+};
+
+const formatSpecialtyLabel = (value) => {
+  const text = String(value || 'General Physician').trim();
+  if (!text) return 'General Physician';
+  return text
+    .toLowerCase()
+    .split(/\s+/)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+};
+
 const mapDoctors = (rawDoctors, userLocation) => {
   if (!Array.isArray(rawDoctors)) return [];
 
-  const seen = new Set();
   const mapped = [];
 
   rawDoctors.forEach((doctor) => {
     const doctorLocation = extractDoctorLocation(doctor);
-    const key = [
-      doctor?.name || '',
-      doctorLocation,
-      doctor?.contact_number || '',
-      doctor?.consultation_fee || '',
-    ].join('|');
-
-    if (seen.has(key)) return;
-    seen.add(key);
 
     const fee = toNumber(doctor?.consultation_fee);
     const latitude = toNumber(doctor?.latitude);
@@ -223,7 +254,7 @@ const mapDoctors = (rawDoctors, userLocation) => {
 
     mapped.push({
       name: doctor?.name || 'Doctor',
-      specialty: doctor?.specialty || 'General Physician',
+      specialty: formatSpecialtyLabel(doctor?.specialty || 'General Physician'),
       experience_years: doctor?.experience_years ?? null,
       availability: 'Recommended',
       rating: Number(ratingOutOfTen.toFixed(1)),
@@ -237,24 +268,34 @@ const mapDoctors = (rawDoctors, userLocation) => {
     });
   });
 
-  return mapped;
+  return dedupeDoctors(mapped);
 };
 
-const dedupeDoctors = (doctors) => {
+const dedupeDoctors = (doctors, preferredSpecialty = '') => {
   if (!Array.isArray(doctors) || doctors.length === 0) return [];
 
-  const seen = new Set();
-  return doctors.filter((doctor) => {
-    const key = [
-      doctor?.name || '',
-      doctor?.specialty || '',
-      extractDoctorLocation(doctor),
-      doctor?.phone || doctor?.contact_number || '',
-    ].join('|');
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+  const bestByKey = new Map();
+  doctors.forEach((doctor) => {
+    if (!normalizeDoctorName(doctor?.name)) return;
+
+    const key = buildDoctorDedupeKey(doctor);
+    const existing = bestByKey.get(key);
+    if (!existing || doctorRankScore(doctor, preferredSpecialty) > doctorRankScore(existing, preferredSpecialty)) {
+      bestByKey.set(key, doctor);
+    }
   });
+
+  // Collapse remaining same-name repeats across slightly different location strings.
+  const bestByName = new Map();
+  bestByKey.forEach((doctor) => {
+    const nameKey = normalizeDoctorName(doctor?.name);
+    const existing = bestByName.get(nameKey);
+    if (!existing || doctorRankScore(doctor, preferredSpecialty) > doctorRankScore(existing, preferredSpecialty)) {
+      bestByName.set(nameKey, doctor);
+    }
+  });
+
+  return Array.from(bestByName.values());
 };
 
 const buildHospitalsFromRecommendations = (rawHospitals, mappedDoctors, userLocation) => {
@@ -434,7 +475,7 @@ const mapClosestResults = (rawResults, userLocation) => {
       doctors.push({
         id: doctorId,
         name: item?.name || 'Doctor',
-        specialty: item?.specialty || 'General Physician',
+        specialty: formatSpecialtyLabel(item?.specialty || 'General Physician'),
         experience_years: null,
         availability: item?.is_fallback ? 'Fallback Recommendation' : 'Recommended',
         rating: Number((ratingOutOfTen ?? 8).toFixed(1)),
@@ -511,14 +552,17 @@ const normalizeAssessmentResponse = (response) => {
   const optionalDoctors = Array.isArray(scrapingOutput?.optional_nearby_doctors?.recommended_doctors)
     ? scrapingOutput.optional_nearby_doctors.recommended_doctors
     : [];
+  const preferredSpecialty = formatSpecialtyLabel(
+    response?.recommended_specialty || 'General Physician'
+  );
   const mappedDoctorsFromRecommendations = mapDoctors(
     [...primaryDoctors, ...optionalDoctors],
     response?.user_location
   );
-  const mappedDoctors = dedupeDoctors([
-    ...mappedDoctorsFromRecommendations,
-    ...mappedFromClosest.doctors,
-  ]);
+  const mappedDoctors = dedupeDoctors(
+    [...mappedDoctorsFromRecommendations, ...mappedFromClosest.doctors],
+    preferredSpecialty
+  );
 
   const hospitalsFromRecommendations = buildHospitalsFromRecommendations(
     scrapingOutput?.recommended_hospitals || [],
